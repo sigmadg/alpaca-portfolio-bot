@@ -1,0 +1,34 @@
+# Credenciales y secretos (nunca subir)
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+venv_*/
+venv_inversion/
+.venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Estado local del bot (no suele ir al repo de portafolio)
+state_*.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Logs opcionales
+*.log
