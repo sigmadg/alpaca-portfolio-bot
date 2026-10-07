@@ -35,9 +35,10 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from cartera_largo_plazo import analizar_cartera_largo_plazo
+    from cartera_largo_plazo import analizar_cartera_largo_plazo, get_tickers_largo_plazo
 except ImportError:
     analizar_cartera_largo_plazo = None
+    get_tickers_largo_plazo = None
 
 try:
     from alpaca_trading_helpers import (
@@ -57,6 +58,17 @@ try:
         should_skip_buy_due_to_cooldown,
         update_trailing_state_for_position,
         normalize_state_positions,
+        aplicar_max_weight_pesos,
+        resolve_peak_and_port,
+        clamp_long_only_order,
+        orders_to_flatten_shorts,
+        sanitize_orders_long_only,
+        sleeve_target_capital,
+        cap_buys_to_cash,
+        filter_orders_own_universe,
+        restore_cash_sells,
+        leftover_exit_orders,
+        finalize_orders_shared_account,
     )
 except ImportError:
     get_portfolio_config = risk_checks = position_size_from_risk = None
@@ -65,6 +77,10 @@ except ImportError:
     mini_report_if_due = full_report_if_due = check_stop_and_trailing = None
     should_skip_buy_due_to_cooldown = update_trailing_state_for_position = None
     normalize_state_positions = None
+    aplicar_max_weight_pesos = resolve_peak_and_port = None
+    clamp_long_only_order = orders_to_flatten_shorts = sanitize_orders_long_only = None
+    sleeve_target_capital = cap_buys_to_cash = filter_orders_own_universe = restore_cash_sells = None
+    leftover_exit_orders = finalize_orders_shared_account = None
 
 try:
     import requests
@@ -78,16 +94,19 @@ CONFIG = {
     'capital_inicial': 10000,
     'riesgo_max': 0.10,
     'riesgo_max_mensual': 0.10,
-    'mini_monitor_interval_seconds': 60,
+    'mini_monitor_interval_seconds': 60,  # Stop cada 60 s
+    'telegram_mini_interval_seconds': 600,  # Monitoreo Telegram cada 10 min
     'full_report_interval_minutes': 30,
     'usar_top_5_acciones': True,
-    'top_5_numero': 4,   # Solo las 4 mejores (no comprar las que están cayendo)
+    'top_5_numero': 6,   # Alto riesgo: 4–8 posiciones
     'top_5_criterio': 'sharpe',
-    'stop_loss_porcentaje': 0.07,   # 7% (ajuste: menos ventas en correcciones pequeñas)
+    'max_weight': 0.35,  # Se reaplica DESPUÉS del Top-N
+    'allocation_pct': 0.50,
+    'cash_reserve': 500.0,
+    'cash_only': True,
     'telegram_bot_token': os.getenv('TELEGRAM_BOT_TOKEN', ''),
     'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID', ''),
     'enviar_telegram': os.getenv('ENVIAR_TELEGRAM', 'true').lower() in ('true', '1', 'yes'),
-    'etiqueta_cartera': 'ALTO RIESGO',
 }
 # Merge helpers; fuente de verdad para reporte grande: full_report_interval_minutes
 if get_portfolio_config is not None:
@@ -97,10 +116,58 @@ if get_portfolio_config is not None:
             continue
         if k not in CONFIG or CONFIG.get(k) is None:
             CONFIG[k] = v
+    for k in (
+        "rebalance_interval_seconds", "max_drawdown", "etiqueta_cartera",
+        "stop_loss_porcentaje", "trailing_stop_porcentaje",
+        "cooldown_minutes_after_stop", "max_trades_per_window", "warmup_seconds",
+        "allocation_pct", "cash_reserve", "cash_only",
+        "telegram_mini_interval_seconds",
+    ):
+        if k in _base:
+            CONFIG[k] = _base[k]
 CONFIG["report_interval_seconds"] = CONFIG["full_report_interval_minutes"] * 60
 if get_portfolio_config is not None and "state_file" not in CONFIG:
     CONFIG["state_file"] = get_portfolio_config("alto_riesgo", {}).get("state_file", "state_high_risk.json")
+OWN_UNIVERSE = set(get_tickers_alto_riesgo().keys()) if get_tickers_alto_riesgo else set()
+FOREIGN_UNIVERSE = set(get_tickers_largo_plazo()) if get_tickers_largo_plazo else set()
 # Opcional: desactivar trailing (solo stop fijo): CONFIG["trailing_stop_porcentaje"] = None
+
+
+def _cash_real(trading):
+    try:
+        if not trading or not trading.api:
+            return 0.0
+        return float(trading.api.get_account().cash)
+    except Exception:
+        return 0.0
+
+
+def _precios_con_posiciones(trading, precios, posiciones):
+    out = dict(precios or {})
+    if not trading:
+        return out
+    for sym in (posiciones or {}):
+        if out.get(sym):
+            continue
+        p = trading.obtener_precio_actual(sym, mostrar_warnings=False)
+        if p:
+            out[sym] = p
+    return out
+
+
+def _preparar_ordenes_seguras(trading, ordenes, posiciones, precios):
+    precios = _precios_con_posiciones(trading, precios, posiciones)
+    if finalize_orders_shared_account is not None:
+        return finalize_orders_shared_account(
+            ordenes,
+            posiciones,
+            precios,
+            _cash_real(trading),
+            own_universe=OWN_UNIVERSE,
+            foreign_universe=FOREIGN_UNIVERSE,
+            cash_reserve=CONFIG.get("cash_reserve", 500.0),
+        )
+    return sanitize_orders_long_only(ordenes, posiciones) if sanitize_orders_long_only else (ordenes or [])
 
 logger = logging.getLogger("alpaca_trading")
 if not logger.handlers:
@@ -135,6 +202,33 @@ def enviar_mensaje_telegram(bot_token, chat_id, mensaje, parse_mode='HTML'):
         return False
 
 
+def enviar_foto_telegram(bot_token, chat_id, image_path, caption=None):
+    """Envía una imagen a Telegram (sendPhoto). Devuelve True si se envió correctamente."""
+    if not REQUESTS_DISPONIBLE or not bot_token or not chat_id or not image_path:
+        return False
+    if not os.path.isfile(image_path):
+        print(f"   ⚠️ Telegram foto: no existe {image_path}")
+        return False
+    try:
+        with open(image_path, 'rb') as f:
+            data = {'chat_id': chat_id}
+            if caption:
+                data['caption'] = caption[:1024]
+            r = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendPhoto",
+                data=data,
+                files={'photo': f},
+                timeout=60,
+            )
+        if r.status_code != 200:
+            print(f"   ⚠️ Telegram foto HTTP {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"   ⚠️ Telegram foto: {e}")
+        return False
+
+
 def _state_ts(state, key):
     """Convierte last_mini_report_ts o last_full_report_ts del estado a float (unix ts). Lee de state['meta'] o state."""
     v = (state.get("meta") or {}).get(key) if isinstance(state.get("meta"), dict) else None
@@ -152,7 +246,7 @@ def _state_ts(state, key):
     return None
 
 
-def _verificar_stop_loss(trading, state, config, price_cache, state_file, warmup_only=False):
+def _verificar_stop_loss(trading, state, config, price_cache, state_file, warmup_only=False, allowed_symbols=None, blocked_symbols=None):
     """
     Stop-loss y trailing stop: actualiza state por símbolo, vende si se activa y registra last_stop_ts (cooldown).
     Si warmup_only=True: solo actualiza max_price_since_entry (no evalúa stop ni vende). Para warm-up inicial.
@@ -168,6 +262,10 @@ def _verificar_stop_loss(trading, state, config, price_cache, state_file, warmup
         for p in positions:
             symbol = getattr(p, "symbol", None)
             if not symbol:
+                continue
+            if blocked_symbols and symbol in blocked_symbols:
+                continue
+            if allowed_symbols and symbol not in allowed_symbols:
                 continue
             qty = float(getattr(p, "qty", 0) or 0)
             if qty <= 0:
@@ -206,6 +304,10 @@ def _verificar_stop_loss(trading, state, config, price_cache, state_file, warmup
     for p in positions:
         symbol = getattr(p, "symbol", None)
         if not symbol:
+            continue
+        if blocked_symbols and symbol in blocked_symbols:
+            continue
+        if allowed_symbols and symbol not in allowed_symbols:
             continue
         qty = float(getattr(p, "qty", 0) or 0)
         if qty <= 0:
@@ -396,20 +498,25 @@ class TradingAlpaca:
         return {t: p / total for t, p in top_pesos.items()}
 
     def rebalancear_cartera(self, pesos_optimizados, precios_actuales, posiciones_actuales, solo_volumen=True, enviar=False):
-        """Construye lista de órdenes de rebalanceo. Si enviar=False (default), no envía; el caller aplica risk/cooldown y envía."""
+        """Construye órdenes de rebalanceo LONG-ONLY (nunca abre shorts)."""
         if not self.api or not precios_actuales:
             return []
         try:
             account = self.api.get_account()
             port_value = float(account.portfolio_value)
+            if sleeve_target_capital is not None:
+                port_value = sleeve_target_capital(port_value, CONFIG.get("allocation_pct", 0.50))
             ordenes = []
+            if orders_to_flatten_shorts is not None:
+                ordenes.extend(orders_to_flatten_shorts(posiciones_actuales))
             for symbol, peso in pesos_optimizados.items():
                 precio = precios_actuales.get(symbol)
                 if not precio or precio <= 0:
                     continue
+                qty_held = float(posiciones_actuales.get(symbol, 0) or 0)
+                long_qty = max(0.0, qty_held)
                 objetivo_valor = port_value * peso
-                qty_actual = posiciones_actuales.get(symbol, 0)
-                valor_actual = qty_actual * precio
+                valor_actual = long_qty * precio
                 diff = objetivo_valor - valor_actual
                 if abs(diff) < 10:
                     continue
@@ -417,9 +524,11 @@ class TradingAlpaca:
                 if qty == 0:
                     continue
                 side = 'buy' if diff > 0 else 'sell'
-                if side == 'sell' and qty_actual < qty:
-                    qty = int(qty_actual)
-                if qty <= 0:
+                if clamp_long_only_order is not None:
+                    side, qty = clamp_long_only_order(side, qty, long_qty)
+                elif side == 'sell':
+                    qty = min(qty, int(long_qty))
+                if not side or qty <= 0:
                     continue
                 ordenes.append({'symbol': symbol, 'side': side, 'qty': qty})
                 if enviar:
@@ -502,14 +611,14 @@ def sistema_completo_alpaca(
     rendimientos_df = resultados.get('rendimientos')
     if CONFIG.get('usar_top_5_acciones'):
         precios_actuales = {}
-        for t in list(pesos_optimizados.keys())[:20]:
+        for t in list(pesos_optimizados.keys())[:30]:
             p = trading.obtener_precio_actual(t, mostrar_warnings=False)
             if p:
                 precios_actuales[t] = p
         if precios_actuales:
             pesos_optimizados = trading.identificar_top_acciones(
                 pesos_optimizados, precios_actuales,
-                num_top=CONFIG.get('top_5_numero', 4),
+                num_top=CONFIG.get('top_5_numero', 6),
                 criterio=CONFIG.get('top_5_criterio', 'sharpe'),
                 rendimientos=rendimientos_df,
             )
@@ -523,8 +632,15 @@ def sistema_completo_alpaca(
     total_p = sum(pesos_optimizados.values())
     if total_p > 0:
         pesos_optimizados = {t: p / total_p for t, p in pesos_optimizados.items()}
+    if aplicar_max_weight_pesos is not None:
+        pesos_optimizados = aplicar_max_weight_pesos(pesos_optimizados, CONFIG.get('max_weight', 0.35))
 
-    logger.info("[HIGH_RISK] Cartera: %d activos", len(pesos_optimizados))
+    logger.info(
+        "[HIGH_RISK] Cartera: %d activos (top %s, max_weight=%.0f%%)",
+        len(pesos_optimizados),
+        CONFIG.get('top_5_numero', 6),
+        CONFIG.get('max_weight', 0.35) * 100,
+    )
     for t, p in sorted(pesos_optimizados.items(), key=lambda x: -x[1])[:10]:
         logger.info("  %s: %.2f%%", t, p * 100)
 
@@ -560,13 +676,20 @@ def sistema_completo_alpaca(
     orders_in_window = []
     last_trade_per_symbol = {}
     last_orders_snapshot = []
+    port_value_now = None
     if trading.api:
         try:
-            peak_equity = float(trading.api.get_account().portfolio_value)
+            port_value_now = float(trading.api.get_account().portfolio_value)
+            if resolve_peak_and_port is not None:
+                port_value_now, peak_equity = resolve_peak_and_port(state, port_value_now)
+            else:
+                peak_equity = port_value_now
+            if save_state:
+                save_state(state_file, state)
         except Exception:
             pass
-    if risk_checks is not None and peak_equity is not None:
-        ok, reason = risk_checks(peak_equity, peak_equity, orders_in_window, CONFIG)
+    if risk_checks is not None and peak_equity is not None and port_value_now is not None:
+        ok, reason = risk_checks(port_value_now, peak_equity, orders_in_window, CONFIG)
         if not ok:
             logger.warning("Risk check bloqueó nuevas operaciones: %s", reason)
             ejecutar_ordenes = False
@@ -574,23 +697,23 @@ def sistema_completo_alpaca(
     if ejecutar_ordenes:
         posiciones_actuales = trading.obtener_todas_posiciones()
         ordenes = trading.rebalancear_cartera(pesos_optimizados, precios_actuales, posiciones_actuales, solo_volumen=True, enviar=False)
-        # Vender posiciones que ya no están en el top N (solo mantener las 4 mejores)
-        top_symbols = set(pesos_optimizados.keys())
-        for sym, qty in (posiciones_actuales or {}).items():
-            if sym not in top_symbols and qty and int(qty) > 0:
-                ordenes.append({'symbol': sym, 'side': 'sell', 'qty': int(qty)})
+        if leftover_exit_orders is not None:
+            ordenes.extend(leftover_exit_orders(posiciones_actuales, pesos_optimizados.keys(), OWN_UNIVERSE, FOREIGN_UNIVERSE))
+        if sanitize_orders_long_only is not None:
+            ordenes = sanitize_orders_long_only(ordenes, posiciones_actuales)
         if ordenes and should_skip_buy_due_to_cooldown:
             cooldown_min = CONFIG.get("cooldown_minutes_after_stop", 30)
             now_ts = time.time()
             _filtered = []
             for o in ordenes:
-                if o.get("side") == "buy" and should_skip_buy_due_to_cooldown(state, o["symbol"], now_ts, cooldown_min):
+                if o.get("side") == "buy" and o.get("reason") != "cover_short" and should_skip_buy_due_to_cooldown(state, o["symbol"], now_ts, cooldown_min):
                     logger.info("[HIGH_RISK] SKIP_BUY_COOLDOWN %s", o["symbol"])
                     continue
                 _filtered.append(o)
             ordenes = _filtered
         if ordenes and apply_cooldown_and_max_trades is not None:
             ordenes, last_trade_per_symbol, orders_in_window = apply_cooldown_and_max_trades(ordenes, last_trade_per_symbol, orders_in_window, CONFIG, state=state)
+        ordenes = _preparar_ordenes_seguras(trading, ordenes, posiciones_actuales, precios_actuales)
         if ordenes:
             for o in ordenes:
                 try:
@@ -611,13 +734,16 @@ def sistema_completo_alpaca(
         etq = CONFIG.get('etiqueta_cartera', 'ALTO RIESGO')
         env_telegram = CONFIG.get('enviar_telegram', False)
         mini_interval = CONFIG.get('mini_monitor_interval_seconds', 60)
+        telegram_mini_interval = CONFIG.get('telegram_mini_interval_seconds', 600)
         full_interval_sec = CONFIG["report_interval_seconds"]
         tiene_telegram = bool(CONFIG.get('telegram_bot_token') and CONFIG.get('telegram_chat_id'))
         telegram_params = {'bot_token': CONFIG.get('telegram_bot_token'), 'chat_id': CONFIG.get('telegram_chat_id')}
         print("\n" + "─" * 50)
         print("   📌 CARTERA:", etq, "(corto plazo)")
-        rebalance_interval = CONFIG.get("rebalance_interval_seconds", 60)
-        print("   ⏱️ Mini reporte: cada", mini_interval, "s. — Rebalanceo cada", rebalance_interval, "s (top 4; stop en cada ciclo)")
+        rebalance_interval = CONFIG.get("rebalance_interval_seconds", 2 * 3600)
+        rebal_txt = f"{rebalance_interval / 3600:.1f}h" if rebalance_interval >= 3600 else f"{rebalance_interval}s"
+        print("   ⏱️ Stop: cada", mini_interval, "s. — Telegram monitoreo: cada", telegram_mini_interval // 60, "min. — Rebalanceo cada", rebal_txt,
+              f"(top {CONFIG.get('top_5_numero', 6)}, max_weight {CONFIG.get('max_weight', 0.35)*100:.0f}%)")
         print("   📋 Reporte grande: cada", full_interval_sec // 60, "min")
         if env_telegram and tiene_telegram:
             print("   📋 Telegram: activado ✅")
@@ -631,58 +757,80 @@ def sistema_completo_alpaca(
                 now_ts = time.time()
                 in_warmup = (now_ts - loop_start_ts) < warmup_seconds
                 if in_warmup:
-                    _verificar_stop_loss(trading, state, CONFIG, price_cache, state_file, warmup_only=True)
+                    _verificar_stop_loss(trading, state, CONFIG, price_cache, state_file, warmup_only=True, allowed_symbols=OWN_UNIVERSE or None, blocked_symbols=FOREIGN_UNIVERSE or None)
                 else:
-                    if _verificar_stop_loss(trading, state, CONFIG, price_cache, state_file):
+                    if _verificar_stop_loss(trading, state, CONFIG, price_cache, state_file, allowed_symbols=OWN_UNIVERSE or None, blocked_symbols=FOREIGN_UNIVERSE or None):
                         if save_state:
                             save_state(state_file, state)
-                # Rebalanceo periódico cada rebalance_interval_seconds (mismo top 4; precios actualizados)
-                rebalance_interval = CONFIG.get("rebalance_interval_seconds", 60)
+                # Rebalanceo periódico (cada ~2h). Stop se revisa cada ciclo arriba.
+                rebalance_interval = CONFIG.get("rebalance_interval_seconds", 2 * 3600)
                 if not in_warmup and (now_ts - last_rebalance_ts) >= rebalance_interval:
                     last_rebalance_ts = now_ts
-                    posiciones_actuales = trading.obtener_todas_posiciones() if trading.api else {}
-                    precios_rebalance = {}
-                    for t in (pesos_optimizados or {}):
-                        p = trading.obtener_precio_actual(t, mostrar_warnings=False)
-                        if p and p > 0:
-                            precios_rebalance[t] = p
-                    if precios_rebalance and pesos_optimizados:
-                        ordenes = trading.rebalancear_cartera(pesos_optimizados, precios_rebalance, posiciones_actuales, solo_volumen=True, enviar=False)
-                        top_symbols = set(pesos_optimizados.keys())
-                        for sym, qty in (posiciones_actuales or {}).items():
-                            if sym not in top_symbols and qty and int(qty) > 0:
-                                ordenes.append({'symbol': sym, 'side': 'sell', 'qty': int(qty)})
-                        if ordenes and should_skip_buy_due_to_cooldown:
-                            cooldown_min = CONFIG.get("cooldown_minutes_after_stop", 30)
-                            _f = []
-                            for o in ordenes:
-                                if o.get("side") == "buy" and should_skip_buy_due_to_cooldown(state, o["symbol"], now_ts, cooldown_min):
-                                    logger.info("[HIGH_RISK] SKIP_BUY_COOLDOWN %s", o["symbol"])
-                                    continue
-                                _f.append(o)
-                            ordenes = _f
-                        if ordenes and apply_cooldown_and_max_trades:
-                            ordenes, last_trade_per_symbol, orders_in_window = apply_cooldown_and_max_trades(ordenes, last_trade_per_symbol, orders_in_window, CONFIG, state=state)
-                        if ordenes:
-                            for o in ordenes:
-                                try:
-                                    trading.api.submit_order(symbol=o['symbol'], qty=o['qty'], side=o['side'], type='market', time_in_force='day')
-                                    orders_in_window.append(datetime.now())
-                                    last_orders_snapshot.append(o)
-                                    logger.info("[HIGH_RISK] Rebalance periódico: %s %s %s", o['side'], o['qty'], o['symbol'])
-                                except Exception as e:
-                                    logger.warning("Orden rebalance %s: %s", o.get('symbol'), e)
+                    risk_blocked = False
+                    try:
+                        if trading.api:
+                            acc = safe_api_call(trading.api.get_account) if safe_api_call else trading.api.get_account()
+                            if acc:
+                                pv = float(acc.portfolio_value)
+                                if resolve_peak_and_port is not None:
+                                    pv, peak_equity = resolve_peak_and_port(state, pv)
+                                if risk_checks is not None and peak_equity is not None:
+                                    ok, reason = risk_checks(pv, peak_equity, orders_in_window, CONFIG)
+                                    if not ok:
+                                        logger.warning("[HIGH_RISK] Rebalance bloqueado por risk: %s", reason)
+                                        risk_blocked = True
+                    except Exception as e:
+                        logger.warning("[HIGH_RISK] Risk pre-rebalance: %s", e)
+                    if not risk_blocked:
+                        posiciones_actuales = trading.obtener_todas_posiciones() if trading.api else {}
+                        precios_rebalance = {}
+                        for t in (pesos_optimizados or {}):
+                            p = trading.obtener_precio_actual(t, mostrar_warnings=False)
+                            if p and p > 0:
+                                precios_rebalance[t] = p
+                        if precios_rebalance and pesos_optimizados:
+                            ordenes = trading.rebalancear_cartera(pesos_optimizados, precios_rebalance, posiciones_actuales, solo_volumen=True, enviar=False)
+                            if leftover_exit_orders is not None:
+                                ordenes.extend(leftover_exit_orders(posiciones_actuales, pesos_optimizados.keys(), OWN_UNIVERSE, FOREIGN_UNIVERSE))
+                            if sanitize_orders_long_only is not None:
+                                ordenes = sanitize_orders_long_only(ordenes, posiciones_actuales)
+                            if ordenes and should_skip_buy_due_to_cooldown:
+                                cooldown_min = CONFIG.get("cooldown_minutes_after_stop", 30)
+                                _f = []
+                                for o in ordenes:
+                                    if o.get("side") == "buy" and o.get("reason") != "cover_short" and should_skip_buy_due_to_cooldown(state, o["symbol"], now_ts, cooldown_min):
+                                        logger.info("[HIGH_RISK] SKIP_BUY_COOLDOWN %s", o["symbol"])
+                                        continue
+                                    _f.append(o)
+                                ordenes = _f
+                            if ordenes and apply_cooldown_and_max_trades:
+                                ordenes, last_trade_per_symbol, orders_in_window = apply_cooldown_and_max_trades(ordenes, last_trade_per_symbol, orders_in_window, CONFIG, state=state)
+                            ordenes = _preparar_ordenes_seguras(trading, ordenes, posiciones_actuales, precios_rebalance)
+                            if ordenes:
+                                for o in ordenes:
+                                    try:
+                                        trading.api.submit_order(symbol=o['symbol'], qty=o['qty'], side=o['side'], type='market', time_in_force='day')
+                                        orders_in_window.append(datetime.now())
+                                        last_orders_snapshot.append(o)
+                                        logger.info("[HIGH_RISK] Rebalance periódico: %s %s %s", o['side'], o['qty'], o['symbol'])
+                                    except Exception as e:
+                                        logger.warning("Orden rebalance %s: %s", o.get('symbol'), e)
                 try:
                     if trading.api:
                         acc = safe_api_call(trading.api.get_account) if safe_api_call else trading.api.get_account()
                         if acc:
                             pv = float(acc.portfolio_value)
-                            peak_equity = max(peak_equity or pv, pv)
+                            if resolve_peak_and_port is not None:
+                                pv, peak_equity = resolve_peak_and_port(state, pv)
+                            else:
+                                peak_equity = max(peak_equity or pv, pv)
+                            if save_state:
+                                save_state(state_file, state)
                 except Exception:
                     pass
                 last_mini_ts = _state_ts(state, "last_mini_report_ts")
                 last_full_ts = _state_ts(state, "last_full_report_ts")
-                debe_mini = mini_report_if_due(now_ts, last_mini_ts, mini_interval) if mini_report_if_due else True
+                debe_mini = mini_report_if_due(now_ts, last_mini_ts, telegram_mini_interval) if mini_report_if_due else True
                 if debe_mini:
                     if generate_mini_report is not None:
                         generate_mini_report(trading, CONFIG, env_telegram and tiene_telegram, enviar_mensaje_telegram, telegram_params, peak_equity=peak_equity, data_stale=False)
@@ -694,12 +842,19 @@ def sistema_completo_alpaca(
                 debe_full = full_report_if_due(now_ts, last_full_ts, full_interval_sec) if full_report_if_due else True
                 if debe_full:
                     # Refrescar top 4 con el análisis actual para que el reporte muestre las mejores acciones de ahora
+                    grafico_path = None
+                    grafico_paths = []
                     try:
                         kwargs = dict(capital_inicial=capital_inicial, riesgo_max=riesgo_max, **(kwargs_analisis or {}))
+                        kwargs['generar_graficos'] = True
                         resultados_refresh = analizar_cartera(**kwargs)
                         if resultados_refresh:
+                            grafico_path = resultados_refresh.get('grafico_path')
+                            grafico_paths = resultados_refresh.get('grafico_paths') or []
                             cartera_opt = resultados_refresh['cartera_optimizada']
-                            rm = resultados_refresh.get('rendimientos_mensuales') or resultados_refresh.get('rendimientos_anuales')
+                            rm = resultados_refresh.get('rendimientos_mensuales')
+                            if rm is None:
+                                rm = resultados_refresh.get('rendimientos_anuales')
                             ticker_symbols_opt = list(rm.index) if rm is not None else resultados_refresh.get('tickers', [])
                             if not ticker_symbols_opt and 'tickers' in resultados_refresh:
                                 ticker_symbols_opt = resultados_refresh['tickers']
@@ -719,14 +874,14 @@ def sistema_completo_alpaca(
                             rendimientos_df = resultados_refresh.get('rendimientos')
                             if CONFIG.get('usar_top_5_acciones'):
                                 precios_refresh = {}
-                                for t in list(nuevos_pesos.keys())[:20]:
+                                for t in list(nuevos_pesos.keys())[:30]:
                                     p = trading.obtener_precio_actual(t, mostrar_warnings=False)
                                     if p:
                                         precios_refresh[t] = p
                                 if precios_refresh:
                                     nuevos_pesos = trading.identificar_top_acciones(
                                         nuevos_pesos, precios_refresh,
-                                        num_top=CONFIG.get('top_5_numero', 4),
+                                        num_top=CONFIG.get('top_5_numero', 6),
                                         criterio=CONFIG.get('top_5_criterio', 'sharpe'),
                                         rendimientos=rendimientos_df,
                                     )
@@ -739,11 +894,25 @@ def sistema_completo_alpaca(
                             total_p = sum(nuevos_pesos.values())
                             if total_p > 0 and nuevos_pesos:
                                 pesos_optimizados = {t: p / total_p for t, p in nuevos_pesos.items()}
-                                logger.info("[HIGH_RISK] Top 4 actualizado para reporte: %s", list(pesos_optimizados.keys()))
+                                if aplicar_max_weight_pesos is not None:
+                                    pesos_optimizados = aplicar_max_weight_pesos(
+                                        pesos_optimizados, CONFIG.get('max_weight', 0.35)
+                                    )
+                                logger.info(
+                                    "[HIGH_RISK] Pesos actualizados para reporte (%d): %s",
+                                    len(pesos_optimizados),
+                                    list(pesos_optimizados.keys()),
+                                )
                     except Exception as e:
                         logger.warning("[HIGH_RISK] No se pudo refrescar análisis para reporte: %s", e)
                     if generate_big_report is not None:
-                        generate_big_report(trading, capital_inicial, CONFIG, env_telegram and tiene_telegram, enviar_mensaje_telegram, telegram_params, last_orders_snapshot, pesos_objetivo=pesos_optimizados, peak_equity=peak_equity)
+                        generate_big_report(
+                            trading, capital_inicial, CONFIG, env_telegram and tiene_telegram,
+                            enviar_mensaje_telegram, telegram_params, last_orders_snapshot,
+                            pesos_objetivo=pesos_optimizados, peak_equity=peak_equity,
+                            image_path=grafico_path, image_paths=grafico_paths,
+                            enviar_foto_fn=enviar_foto_telegram,
+                        )
                     else:
                         try:
                             account = trading.api.get_account()
@@ -757,6 +926,14 @@ def sistema_completo_alpaca(
                                 msg += f"  • {p.symbol}: {p.qty} → ${float(p.market_value or 0):,.2f}\n"
                             if env_telegram and tiene_telegram:
                                 enviar_mensaje_telegram(CONFIG['telegram_bot_token'], CONFIG['telegram_chat_id'], msg)
+                                for i, item in enumerate(grafico_paths or ([] if not grafico_path else [{"path": grafico_path, "caption": "Gráficas"}]), 1):
+                                    path = item.get("path") if isinstance(item, dict) else item
+                                    cap = item.get("caption", "Gráfica") if isinstance(item, dict) else "Gráfica"
+                                    if path:
+                                        enviar_foto_telegram(
+                                            CONFIG['telegram_bot_token'], CONFIG['telegram_chat_id'], path,
+                                            caption=f"📊 [{etq}] {cap} ({i}/{max(len(grafico_paths), 1)})",
+                                        )
                             logger.info("[HIGH_RISK] Reporte completo enviado.")
                         except Exception as e:
                             logger.warning("Reporte completo: %s", e)
@@ -787,6 +964,7 @@ if __name__ == "__main__":
 
         riesgo_max = CONFIG.get('riesgo_max_mensual', CONFIG['riesgo_max'])
         print(f"\n🚀 Iniciando cartera: alto_riesgo | riesgo_max MENSUAL: {riesgo_max*100:.1f}%")
+        print(f"   📌 Top {CONFIG.get('top_5_numero', 6)} + max_weight {CONFIG.get('max_weight', 0.35)*100:.0f}% | rebalanceo 2h | stop cada 60s")
         print("=" * 80)
 
         resultado = sistema_completo_alpaca(
@@ -798,7 +976,7 @@ if __name__ == "__main__":
             tipo_cartera='alto_riesgo',
             analizar_cartera=analizar_cartera_alto_riesgo,
             tickers_completos=TICKERS_ALTO_RIESGO,
-            kwargs_analisis={'generar_graficos': False},
+            kwargs_analisis={'generar_graficos': True},
             analizar_cartera_largo_plazo=analizar_cartera_largo_plazo,
         )
 

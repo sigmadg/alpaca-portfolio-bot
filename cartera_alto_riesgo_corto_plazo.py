@@ -4,12 +4,27 @@ Estrategia: Alto Riesgo con Potencial de Altas Ganancias Mensuales
 ⚠️ ADVERTENCIA: Esta estrategia conlleva mayor riesgo de pérdidas
 """
 
+import os
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
+GRAFICOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_graficos')
+
+
+def _guardar_grafica(fig, slug, stamp):
+    os.makedirs(GRAFICOS_DIR, exist_ok=True)
+    path = os.path.join(GRAFICOS_DIR, f'{slug}_{stamp}.png')
+    fig.tight_layout()
+    fig.savefig(path, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
 
 # Intentar importar yfinance
 try:
@@ -54,16 +69,42 @@ def optimizar_cartera_rendimiento_objetivo(C, m, rendimiento_objetivo):
     return {'pesos': w_opt, 'riesgo': riesgo, 'rendimiento': rendimiento}
 
 
-def optimizar_cartera_maximo_rendimiento(C, m):
-    """Optimiza cartera para máximo rendimiento (alto riesgo)."""
+def optimizar_cartera_maximo_rendimiento(C, m, max_weight=0.35):
+    """
+    Alto riesgo sin winner-takes-all: score = momentum / volatilidad (Sortino-like simple),
+    pesos proporcionales a scores positivos con tope max_weight por activo.
+    """
     n = len(C)
-    # Encontrar el activo con mayor rendimiento esperado
-    idx_max = np.argmax(m)
-    w_opt = np.zeros(n)
-    w_opt[idx_max] = 1.0
-    
-    riesgo = np.sqrt(w_opt @ C @ w_opt.T)
-    rendimiento = w_opt @ m
+    m_arr = np.asarray(m, dtype=float).reshape(-1)
+    vol = np.sqrt(np.maximum(np.diag(np.asarray(C, dtype=float)), 1e-12))
+    score = m_arr / vol
+    score = np.maximum(score, 0.0)
+    w_opt = np.zeros(n, dtype=float)
+    if float(score.sum()) <= 0:
+        # Fallback: repartir entre los mejores por retorno esperado
+        k = max(1, min(n, int(np.floor(1.0 / max_weight)) if max_weight > 0 else n))
+        idx = np.argsort(m_arr)[::-1][:k]
+        w_opt[idx] = 1.0 / len(idx)
+    else:
+        w_opt = score / score.sum()
+
+    # Aplicar máximo de concentración y renormalizar de forma iterativa
+    if max_weight is None or max_weight <= 0:
+        max_weight = 1.0
+    if n * max_weight < 1.0:
+        max_weight = 1.0 / n
+    for _ in range(25):
+        w_opt = np.minimum(w_opt, max_weight)
+        s = w_opt.sum()
+        if s <= 0:
+            w_opt = np.ones(n) / n
+            break
+        w_opt = w_opt / s
+        if np.all(w_opt <= max_weight + 1e-12):
+            break
+
+    riesgo = float(np.sqrt(w_opt @ C @ w_opt.T))
+    rendimiento = float(w_opt @ m_arr)
     return {'pesos': w_opt, 'riesgo': riesgo, 'rendimiento': rendimiento}
 
 
@@ -377,10 +418,10 @@ def analizar_cartera_alto_riesgo(capital_inicial=10000, riesgo_max=0.20, generar
     print("PARTE 4: OPTIMIZACIÓN DE CARTERA (ALTO RENDIMIENTO)")
     print("=" * 80)
     
-    # Cartera de máximo rendimiento (más agresiva)
-    resultado_max_rendimiento = optimizar_cartera_maximo_rendimiento(C_mensual, m_mensual)
+    # Cartera momentum/vol con tope de concentración (ya no 100% en un solo activo)
+    resultado_max_rendimiento = optimizar_cartera_maximo_rendimiento(C_mensual, m_mensual, max_weight=0.35)
     
-    print("\n🎯 CARTERA DE MÁXIMO RENDIMIENTO (100% en el activo más rentable):")
+    print("\n🎯 CARTERA MOMENTUM/VOL (máx 35% por activo):")
     print("-" * 80)
     for i, (ticker, nombre) in enumerate(zip(ticker_symbols, nombres)):
         peso_pct = resultado_max_rendimiento['pesos'][i] * 100
@@ -393,9 +434,9 @@ def analizar_cartera_alto_riesgo(capital_inicial=10000, riesgo_max=0.20, generar
     
     # Optimizar con restricción de riesgo máximo pero buscando alto rendimiento
     rendimiento_objetivo = np.mean(m_mensual) * 1.2  # 120% del promedio para alto rendimiento
-    max_weight_ticker = 0.12  # Peso máximo por ticker
-    cap_soxl = 0.10  # Cap SOXL
-    cap_cripto_conjunto = 0.10  # Cap conjunto MSTR + COIN
+    max_weight_ticker = 0.35  # Peso máximo por ticker (agresivo pero no 100%)
+    cap_soxl = 0.15  # Cap SOXL
+    cap_cripto_conjunto = 0.20  # Cap conjunto MSTR + COIN
 
     print(f"\n🎯 CARTERA OPTIMIZADA (Riesgo máximo: {riesgo_max*100:.2f}%):")
     print(f"   Rendimiento objetivo inicial: {rendimiento_objetivo*100:.2f}% mensual")
@@ -552,97 +593,136 @@ def analizar_cartera_alto_riesgo(capital_inicial=10000, riesgo_max=0.20, generar
     # ========================================================================
     # PARTE 6: VISUALIZACIONES (Opcional)
     # ========================================================================
+    grafico_path = None
+    grafico_paths = []
     if generar_graficos:
         print("\n" + "=" * 80)
-        print("PARTE 6: GENERANDO VISUALIZACIONES")
+        print("PARTE 6: GENERANDO VISUALIZACIONES (una por imagen)")
         print("=" * 80)
-        
-        fig = plt.figure(figsize=(16, 10))
-        
-        # 1. Distribución de pesos
-        ax1 = plt.subplot(2, 3, 1)
-        pesos_pct = resultado_optimizado['pesos'] * 100
-        colores = plt.cm.Reds(range(len(ticker_symbols)))
-        bars = ax1.barh(ticker_symbols, pesos_pct, color=colores)
-        ax1.set_xlabel('Peso (%)', fontweight='bold')
-        ax1.set_title('Distribución de la Cartera\n(ALTO RIESGO)', fontweight='bold', color='red')
-        ax1.grid(True, alpha=0.3, axis='x')
-        for i, (bar, peso) in enumerate(zip(bars, pesos_pct)):
-            if abs(peso) > 0.01:
-                ax1.text(peso, i, f'{peso:.1f}%', va='center', fontweight='bold')
-        
-        # 2. Riesgo vs Rendimiento (Mensual)
-        ax2 = plt.subplot(2, 3, 2)
-        ax2.scatter(volatilidades_mensuales*100, rendimientos_mensuales*100, 
-                   s=200, alpha=0.6, color='red')
-        for i, ticker in enumerate(ticker_symbols):
-            ax2.annotate(ticker, (volatilidades_mensuales[i]*100, rendimientos_mensuales[i]*100),
-                        fontsize=10, fontweight='bold')
-        ax2.scatter(resultado_optimizado['riesgo']*100, 
-                   resultado_optimizado['rendimiento']*100,
-                   s=400, color='darkred', marker='*', label='Cartera Óptima', zorder=5)
-        ax2.set_xlabel('Riesgo Mensual (%)', fontweight='bold')
-        ax2.set_ylabel('Rendimiento Mensual (%)', fontweight='bold')
-        ax2.set_title('Riesgo vs. Rendimiento (ALTO RIESGO)', fontweight='bold', color='red')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # 3. Distribución de valores futuros
-        ax3 = plt.subplot(2, 3, 3)
-        ax3.hist(valores_futuros_cartera, bins=50, alpha=0.7, edgecolor='black', color='crimson')
-        ax3.axvline(valor_futuro_promedio, color='red', linestyle='--', 
-                    linewidth=2, label=f'Promedio: ${valor_futuro_promedio:,.0f}')
-        ax3.axvline(capital_inicial, color='blue', linestyle='--', 
-                    linewidth=2, label=f'Inicial: ${capital_inicial:,.0f}')
-        ax3.axvline(percentil_5, color='darkred', linestyle=':', 
-                    linewidth=2, label=f'Peor 5%: ${percentil_5:,.0f}')
-        ax3.set_xlabel('Valor de la Cartera ($)', fontweight='bold')
-        ax3.set_ylabel('Frecuencia', fontweight='bold')
-        ax3.set_title('Distribución de Valores (1 Mes) - ALTO RIESGO', fontweight='bold', color='red')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3, axis='y')
-        
-        # 4. Evolución de precios (últimos 3 meses)
-        ax4 = plt.subplot(2, 3, 4)
-        precios_recientes = precios.tail(63)  # Últimos 3 meses
-        for ticker in ticker_symbols:
-            precios_norm = (precios_recientes[ticker] / precios_recientes[ticker].iloc[0]) * 100
-            ax4.plot(precios_recientes.index, precios_norm, label=ticker, linewidth=1.5)
-        ax4.set_title('Evolución Reciente (3 meses)', fontweight='bold')
-        ax4.set_xlabel('Fecha')
-        ax4.set_ylabel('Precio Normalizado (Base=100)')
-        ax4.legend(fontsize=8)
-        ax4.grid(True, alpha=0.3)
-        
-        # 5. Matriz de correlación
-        ax5 = plt.subplot(2, 3, 5)
-        im = ax5.imshow(correlaciones.values, cmap='Reds', vmin=-1, vmax=1, aspect='auto')
-        ax5.set_xticks(range(len(ticker_symbols)))
-        ax5.set_yticks(range(len(ticker_symbols)))
-        ax5.set_xticklabels(ticker_symbols)
-        ax5.set_yticklabels(ticker_symbols)
-        ax5.set_title('Matriz de Correlación', fontweight='bold')
-        for i in range(len(ticker_symbols)):
-            for j in range(len(ticker_symbols)):
-                ax5.text(j, i, f'{correlaciones.iloc[i, j]:.2f}',
-                        ha='center', va='center', fontweight='bold', fontsize=9)
-        plt.colorbar(im, ax=ax5)
-        
-        # 6. Resumen de inversión
-        ax6 = plt.subplot(2, 3, 6)
-        inversiones = capital_inicial * resultado_optimizado['pesos']
-        ax6.pie(inversiones, labels=ticker_symbols, autopct='%1.1f%%', 
-               startangle=90, colors=colores)
-        ax6.set_title(f'Distribución de Inversión\n${capital_inicial:,.0f} - ALTO RIESGO', 
-                     fontweight='bold', color='red')
-        
-        plt.tight_layout()
-        
-        # Guardar gráfico
-        nombre_archivo = f'cartera_alto_riesgo_{datetime.now().strftime("%Y%m%d")}.png'
-        plt.savefig(nombre_archivo, dpi=300, bbox_inches='tight')
-        plt.close()  # Cerrar figura para liberar memoria
-        print(f"\n✅ Visualizaciones guardadas en: {nombre_archivo}")
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pesos_arr = np.asarray(resultado_optimizado['pesos'], dtype=float)
+            vol_arr = np.asarray(volatilidades_mensuales, dtype=float)
+            rend_arr = np.asarray(rendimientos_mensuales, dtype=float)
+            pesos_pct = pesos_arr * 100
+            colores = plt.cm.Reds(np.linspace(0.3, 0.9, len(ticker_symbols)))
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            bars = ax.barh(list(ticker_symbols), pesos_pct, color=colores)
+            ax.set_xlabel('Peso (%)', fontweight='bold')
+            ax.set_title('Distribución de la Cartera (ALTO RIESGO)', fontweight='bold', color='red')
+            ax.grid(True, alpha=0.3, axis='x')
+            for i, (bar, peso) in enumerate(zip(bars, pesos_pct)):
+                if abs(peso) > 0.01:
+                    ax.text(peso, i, f'{peso:.1f}%', va='center', fontweight='bold')
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'hr_pesos', stamp),
+                'caption': 'Distribución de pesos',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.scatter(vol_arr * 100, rend_arr * 100, s=200, alpha=0.6, color='red')
+            for i, ticker in enumerate(ticker_symbols):
+                ax.annotate(ticker, (vol_arr[i] * 100, rend_arr[i] * 100), fontsize=10, fontweight='bold')
+            ax.scatter(
+                resultado_optimizado['riesgo'] * 100,
+                resultado_optimizado['rendimiento'] * 100,
+                s=400, color='darkred', marker='*', label='Cartera Óptima', zorder=5,
+            )
+            ax.set_xlabel('Riesgo Mensual (%)', fontweight='bold')
+            ax.set_ylabel('Rendimiento Mensual (%)', fontweight='bold')
+            ax.set_title('Riesgo vs. Rendimiento (ALTO RIESGO)', fontweight='bold', color='red')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'hr_riesgo_rendimiento', stamp),
+                'caption': 'Riesgo vs rendimiento',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(valores_futuros_cartera, bins=50, alpha=0.7, edgecolor='black', color='crimson')
+            ax.axvline(valor_futuro_promedio, color='red', linestyle='--',
+                       linewidth=2, label=f'Promedio: ${valor_futuro_promedio:,.0f}')
+            ax.axvline(capital_inicial, color='blue', linestyle='--',
+                       linewidth=2, label=f'Inicial: ${capital_inicial:,.0f}')
+            ax.axvline(percentil_5, color='darkred', linestyle=':',
+                       linewidth=2, label=f'Peor 5%: ${percentil_5:,.0f}')
+            ax.set_xlabel('Valor de la Cartera ($)', fontweight='bold')
+            ax.set_ylabel('Frecuencia', fontweight='bold')
+            ax.set_title('Distribución de Valores (1 Mes) - ALTO RIESGO', fontweight='bold', color='red')
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis='y')
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'hr_valores_futuros', stamp),
+                'caption': 'Valores futuros (1 mes)',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            precios_recientes = precios.tail(63)
+            for ticker in ticker_symbols:
+                if ticker not in precios_recientes.columns:
+                    continue
+                serie = precios_recientes[ticker].dropna()
+                if serie.empty or serie.iloc[0] == 0:
+                    continue
+                precios_norm = (serie / serie.iloc[0]) * 100
+                ax.plot(precios_norm.index, precios_norm, label=ticker, linewidth=1.5)
+            ax.set_title('Evolución Reciente (3 meses)', fontweight='bold')
+            ax.set_xlabel('Fecha')
+            ax.set_ylabel('Precio Normalizado (Base=100)')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'hr_evolucion', stamp),
+                'caption': 'Evolución reciente (3 meses)',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 8))
+            im = ax.imshow(correlaciones.values, cmap='Reds', vmin=-1, vmax=1, aspect='auto')
+            ax.set_xticks(range(len(ticker_symbols)))
+            ax.set_yticks(range(len(ticker_symbols)))
+            ax.set_xticklabels(ticker_symbols)
+            ax.set_yticklabels(ticker_symbols)
+            ax.set_title('Matriz de Correlación', fontweight='bold')
+            for i in range(len(ticker_symbols)):
+                for j in range(len(ticker_symbols)):
+                    ax.text(j, i, f'{correlaciones.iloc[i, j]:.2f}',
+                            ha='center', va='center', fontweight='bold', fontsize=9)
+            fig.colorbar(im, ax=ax)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'hr_correlacion', stamp),
+                'caption': 'Matriz de correlación',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            inversiones = capital_inicial * pesos_arr
+            mask = np.abs(inversiones) > 1e-6
+            if mask.any():
+                pie_colors = colores[mask] if len(colores) == len(mask) else None
+                ax.pie(
+                    np.abs(inversiones[mask]),
+                    labels=[t for t, m in zip(ticker_symbols, mask) if m],
+                    autopct='%1.1f%%',
+                    startangle=90,
+                    colors=pie_colors,
+                )
+            ax.set_title(
+                f'Distribución de Inversión ${capital_inicial:,.0f} - ALTO RIESGO',
+                fontweight='bold', color='red',
+            )
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'hr_inversion', stamp),
+                'caption': 'Distribución de inversión',
+            })
+
+            grafico_path = grafico_paths[0]['path'] if grafico_paths else None
+            print(f"\n✅ {len(grafico_paths)} visualizaciones guardadas por separado")
+        except Exception as e:
+            print(f"\n⚠️  Error generando gráficos alto riesgo: {e}")
+            try:
+                plt.close('all')
+            except Exception:
+                pass
     else:
         print("\n⏩ Saltando generación de gráficos (modo rápido)")
     
@@ -710,7 +790,10 @@ def analizar_cartera_alto_riesgo(capital_inicial=10000, riesgo_max=0.20, generar
         'simulaciones': valores_futuros_cartera,
         'ganancia_esperada': ganancia_promedio,
         'percentil_5': percentil_5,
-        'percentil_95': percentil_95
+        'percentil_95': percentil_95,
+        'tickers': list(ticker_symbols),
+        'grafico_path': grafico_path,
+        'grafico_paths': grafico_paths,
     }
 
 

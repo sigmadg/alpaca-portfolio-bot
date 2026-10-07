@@ -20,6 +20,10 @@ build/
 # Estado local del bot (no suele ir al repo de portafolio)
 state_*.json
 
+# Gráficos generados para Telegram
+temp_graficos/
+*.png
+
 # IDE / OS
 .idea/
 .vscode/

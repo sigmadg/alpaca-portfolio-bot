@@ -9,6 +9,7 @@ Helpers reutilizables para trading Alpaca (alto y bajo riesgo).
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -197,31 +198,356 @@ def full_report_if_due(now_ts: float, last_ts: Optional[float], interval_seconds
     return (now_ts - last_ts) >= interval_seconds
 
 
+def clamp_long_only_order(side: str, qty: int, qty_held: float) -> tuple:
+    """
+    Long-only: nunca abre ni profundiza un short.
+    - sell: solo hasta la cantidad long (>=0) poseída.
+    - buy: se permite (cubre shorts o abre long).
+    Devuelve (side, qty) o (None, 0) si no hay orden válida.
+    """
+    try:
+        q = int(qty)
+    except (TypeError, ValueError):
+        return None, 0
+    if q <= 0:
+        return None, 0
+    held = float(qty_held or 0)
+    if side == "sell":
+        long_qty = int(max(0.0, held))
+        q = min(q, long_qty)
+        if q <= 0:
+            return None, 0
+        return "sell", q
+    if side == "buy":
+        return "buy", q
+    return None, 0
+
+
+def orders_to_flatten_shorts(posiciones_actuales: Dict[str, float]) -> list:
+    """Genera buys para cerrar cualquier qty negativa (short)."""
+    out = []
+    for sym, qty in (posiciones_actuales or {}).items():
+        try:
+            q = float(qty)
+        except (TypeError, ValueError):
+            continue
+        if q < -1e-9:
+            cover = int(abs(q))
+            if cover > 0:
+                out.append({"symbol": sym, "side": "buy", "qty": cover, "reason": "cover_short"})
+    return out
+
+
+def sanitize_orders_long_only(ordenes, posiciones_actuales: Optional[Dict[str, float]] = None) -> list:
+    """Filtra/ajusta órdenes para que ningún sell abra o agrande un short."""
+    held: Dict[str, float] = {k: float(v) for k, v in (posiciones_actuales or {}).items()}
+    out = []
+    for o in ordenes or []:
+        if not isinstance(o, dict):
+            continue
+        sym = o.get("symbol")
+        side = o.get("side")
+        qty = o.get("qty")
+        if not sym or not side:
+            continue
+        side2, qty2 = clamp_long_only_order(side, qty, held.get(sym, 0.0))
+        if not side2 or qty2 <= 0:
+            _logger.info("SKIP_SHORT_GUARD %s %s qty=%s held=%s", side, sym, qty, held.get(sym, 0.0))
+            continue
+        neo = dict(o)
+        neo["side"] = side2
+        neo["qty"] = qty2
+        out.append(neo)
+        if side2 == "buy":
+            held[sym] = held.get(sym, 0.0) + qty2
+        else:
+            held[sym] = held.get(sym, 0.0) - qty2
+    return out
+
+
+def sleeve_target_capital(equity: float, allocation_pct: float) -> float:
+    """Capital máximo de ESTA cartera dentro de una cuenta compartida."""
+    try:
+        eq = float(equity or 0)
+        pct = float(allocation_pct or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if eq <= 0 or pct <= 0:
+        return 0.0
+    return eq * min(pct, 1.0)
+
+
+def cash_available_for_buys(cash: float, cash_reserve: float = 500.0) -> float:
+    """Solo cash real menos reserva. Nunca buying_power/margen."""
+    try:
+        c = float(cash or 0)
+        r = float(cash_reserve or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, c - max(0.0, r))
+
+
+def filter_orders_own_universe(
+    ordenes,
+    own_universe=None,
+    foreign_universe=None,
+) -> list:
+    """
+    Un bot no vende ni compra el universo de la otra cartera.
+    cover_short sí se permite (cerrar riesgo).
+    """
+    own = {str(s).upper() for s in (own_universe or [])}
+    foreign = {str(s).upper() for s in (foreign_universe or [])}
+    out = []
+    for o in ordenes or []:
+        if not isinstance(o, dict):
+            continue
+        sym = str(o.get("symbol") or "").upper()
+        side = (o.get("side") or "").lower()
+        if o.get("reason") == "cover_short":
+            out.append(o)
+            continue
+        if foreign and sym in foreign:
+            _logger.info("SKIP_OTHER_SLEEVE %s %s", side, sym)
+            continue
+        if own and sym not in own:
+            if side == "sell":
+                _logger.info("SKIP_SELL_OUTSIDE_UNIVERSE %s", sym)
+                continue
+        out.append(o)
+    return out
+
+
+def cap_buys_to_cash(ordenes, precios: Optional[Dict[str, float]], cash: float, cash_reserve: float = 500.0) -> list:
+    """
+    Aplica ventas primero (liberan cash) y luego compras solo si hay cash real.
+    Evita margen y cash negativo.
+    """
+    available = float(cash or 0)
+    reserve = float(cash_reserve or 0)
+    precios = precios or {}
+    sells = [o for o in (ordenes or []) if (o.get("side") or "").lower() == "sell"]
+    covers = [o for o in (ordenes or []) if o.get("reason") == "cover_short"]
+    buys = [
+        o for o in (ordenes or [])
+        if (o.get("side") or "").lower() == "buy" and o.get("reason") != "cover_short"
+    ]
+    out = list(sells)
+    for o in sells:
+        px = float(precios.get(o.get("symbol"), 0) or 0)
+        qty = float(o.get("qty") or 0)
+        if px > 0 and qty > 0:
+            available += px * qty
+    # Cubrir shorts solo con cash libre (si no hay, no agrandar el hueco)
+    spendable = available - reserve
+    for o in covers:
+        px = float(precios.get(o.get("symbol"), 0) or 0)
+        qty = int(o.get("qty") or 0)
+        if px <= 0 or qty <= 0:
+            continue
+        max_qty = int(spendable // px) if spendable > 0 else 0
+        qty = min(qty, max_qty)
+        if qty <= 0:
+            _logger.info("SKIP_COVER_NO_CASH %s", o.get("symbol"))
+            continue
+        neo = dict(o)
+        neo["qty"] = qty
+        out.append(neo)
+        spendable -= px * qty
+        available -= px * qty
+    spendable = available - reserve
+    if spendable <= 0:
+        for o in buys:
+            _logger.info("SKIP_BUY_NO_CASH %s qty=%s", o.get("symbol"), o.get("qty"))
+        return out
+    for o in buys:
+        px = float(precios.get(o.get("symbol"), 0) or 0)
+        qty = int(o.get("qty") or 0)
+        if px <= 0 or qty <= 0:
+            continue
+        max_qty = int(spendable // px)
+        if max_qty <= 0:
+            _logger.info("SKIP_BUY_NO_CASH %s qty=%s", o.get("symbol"), qty)
+            continue
+        if qty > max_qty:
+            _logger.info("TRIM_BUY %s %s→%s (cash)", o.get("symbol"), qty, max_qty)
+            qty = max_qty
+        neo = dict(o)
+        neo["qty"] = qty
+        out.append(neo)
+        spendable -= px * qty
+    return out
+
+
+def restore_cash_sells(
+    posiciones_actuales: Dict[str, float],
+    precios: Dict[str, float],
+    cash: float,
+    cash_reserve: float,
+    own_universe=None,
+    foreign_universe=None,
+) -> list:
+    """Si el cash está bajo/negativo, vende de ESTA manga lo mínimo para volver a reserva."""
+    try:
+        need = float(cash_reserve or 0) - float(cash or 0)
+    except (TypeError, ValueError):
+        return []
+    if need <= 0:
+        return []
+    own = {str(s).upper() for s in (own_universe or [])}
+    foreign = {str(s).upper() for s in (foreign_universe or [])}
+    candidates = []
+    for sym, qty in (posiciones_actuales or {}).items():
+        s = str(sym).upper()
+        q = float(qty or 0)
+        px = float((precios or {}).get(sym) or (precios or {}).get(s) or 0)
+        if q < 1 or px <= 0:
+            continue
+        if foreign and s in foreign:
+            continue
+        if own and s not in own:
+            continue
+        candidates.append((s, int(q), px, q * px))
+    candidates.sort(key=lambda x: -x[3])
+    out = []
+    remaining = need
+    for s, q, px, _mv in candidates:
+        qty_sell = min(q, max(1, int((remaining / px) + 0.999)))
+        qty_sell = min(qty_sell, q)
+        if qty_sell <= 0:
+            continue
+        out.append({"symbol": s, "side": "sell", "qty": qty_sell, "reason": "restore_cash"})
+        remaining -= qty_sell * px
+        if remaining <= 0:
+            break
+    return out
+
+
+def leftover_exit_orders(
+    posiciones_actuales,
+    top_symbols,
+    own_universe=None,
+    foreign_universe=None,
+) -> list:
+    """Vende solo leftovers de ESTA manga; cubre shorts de cualquiera."""
+    top = {str(s).upper() for s in (top_symbols or [])}
+    own = {str(s).upper() for s in (own_universe or [])}
+    foreign = {str(s).upper() for s in (foreign_universe or [])}
+    out = []
+    for sym, qty in (posiciones_actuales or {}).items():
+        s = str(sym).upper()
+        try:
+            q = float(qty or 0)
+        except (TypeError, ValueError):
+            continue
+        if s in top:
+            continue
+        if q < -1e-9:
+            cover = int(abs(q))
+            if cover > 0:
+                out.append({"symbol": s, "side": "buy", "qty": cover, "reason": "cover_short"})
+            continue
+        if q < 1:
+            continue
+        if foreign and s in foreign:
+            continue
+        if own and s not in own:
+            continue
+        out.append({"symbol": s, "side": "sell", "qty": int(q), "reason": "exit_not_in_top"})
+    return out
+
+
+def finalize_orders_shared_account(
+    ordenes,
+    posiciones_actuales,
+    precios,
+    cash,
+    own_universe=None,
+    foreign_universe=None,
+    cash_reserve=500.0,
+    restore_cash=True,
+) -> list:
+    """Filtro final: no tocar la otra manga, recuperar cash y no comprar con margen."""
+    ordenes = list(ordenes or [])
+    if restore_cash:
+        ordenes.extend(
+            restore_cash_sells(
+                posiciones_actuales or {},
+                precios or {},
+                cash,
+                cash_reserve,
+                own_universe=own_universe,
+                foreign_universe=foreign_universe,
+            )
+        )
+    ordenes = filter_orders_own_universe(ordenes, own_universe, foreign_universe)
+    ordenes = sanitize_orders_long_only(ordenes, posiciones_actuales)
+    ordenes = cap_buys_to_cash(ordenes, precios, cash, cash_reserve)
+    return sanitize_orders_long_only(ordenes, posiciones_actuales)
+
+
 def get_portfolio_config(tipo_cartera, env_config=None):
     """
     Configuración centralizada por cartera. env_config puede sobreescribir (ej. desde CONFIG del script).
-    Frecuencias obligatorias:
-    - LARGO PLAZO: report_interval_seconds=3600 (60 min), mini_monitor_interval_seconds=60.
-    - ALTO RIESGO: report_interval_seconds=1800 (30 min), mini_monitor_interval_seconds=60.
+
+    Arquitectura de riesgo (v2):
+    - CORE / LARGO PLAZO: stop cada 60s, rebalanceo semanal, 8–15 posiciones, max_weight 15%.
+    - ALTO RIESGO: stop cada 60s, rebalanceo cada 2h, 4–8 posiciones, max_weight 35%.
     """
-    base = {
-        "report_interval_seconds": 3600 if tipo_cartera == "largo_plazo" else 1800,
-        "mini_monitor_interval_seconds": 60,  # Ambas carteras: notificaciones cada 60 s
-        "max_risk_per_trade": 0.005 if tipo_cartera == "largo_plazo" else 0.01,
-        "rr_ratio": 2.0 if tipo_cartera == "largo_plazo" else 1.5,
-        "cooldown_seconds": 3600 if tipo_cartera == "largo_plazo" else 600,
-        "cooldown_after_stop_seconds": 21600 if tipo_cartera == "largo_plazo" else 1800,  # 6h bajo riesgo, 30 min alto
-        "cooldown_minutes_after_stop": 360 if tipo_cartera == "largo_plazo" else 30,
-        "max_drawdown": 0.12 if tipo_cartera == "largo_plazo" else 0.08,  # 12% / 8% para no bloquear tanto en caídas
-        "max_trades_per_window": 3 if tipo_cartera == "largo_plazo" else 6,
-        "window_seconds": 86400 if tipo_cartera == "largo_plazo" else 3600,
-        "stop_loss_porcentaje": 0.07,   # 7% (ajuste conservador: menos ventas en correcciones pequeñas)
-        "trailing_stop_porcentaje": 0.07,  # 7% (opcional: None = solo stop fijo)
-        "etiqueta_cartera": "BAJO RIESGO" if tipo_cartera == "largo_plazo" else "ALTO RIESGO",
-        "state_file": "state_low_risk.json" if tipo_cartera == "largo_plazo" else "state_high_risk.json",
-        "warmup_seconds": 180,  # Durante warm-up solo se actualiza max_price_since_entry; no compras/ventas
-        "rebalance_interval_seconds": 60,  # Rebalanceo periódico cada minuto (mismo target pesos; precios actualizados)
-    }
+    if tipo_cartera == "largo_plazo":
+        base = {
+            "report_interval_seconds": 3600,
+            "mini_monitor_interval_seconds": 60,  # stop / loop
+            "telegram_mini_interval_seconds": 600,  # monitoreo Telegram cada 10 min
+            "rebalance_interval_seconds": 7 * 24 * 3600,  # semanal
+            "max_risk_per_trade": 0.005,
+            "rr_ratio": 2.0,
+            "cooldown_seconds": 3600,
+            "cooldown_after_stop_seconds": 21600,
+            "cooldown_minutes_after_stop": 360,
+            "max_drawdown": 0.12,
+            "max_trades_per_window": 5,
+            "window_seconds": 86400,
+            "stop_loss_porcentaje": 0.08,
+            "trailing_stop_porcentaje": 0.10,  # trailing amplio / opcional en LP
+            "etiqueta_cartera": "CORE / LARGO PLAZO",
+            "state_file": "state_low_risk.json",
+            "warmup_seconds": 180,
+            "max_weight": 0.15,
+            "top_n_posiciones": 12,
+            "usar_filtro_top": True,
+            "top_criterio": "sharpe",
+            "allocation_pct": 0.50,
+            "cash_reserve": 500.0,
+            "cash_only": True,
+        }
+    else:
+        base = {
+            "report_interval_seconds": 1800,
+            "mini_monitor_interval_seconds": 60,
+            "telegram_mini_interval_seconds": 600,
+            "rebalance_interval_seconds": 2 * 3600,  # 2 horas
+            "max_risk_per_trade": 0.01,
+            "rr_ratio": 1.5,
+            "cooldown_seconds": 600,
+            "cooldown_after_stop_seconds": 1800,
+            "cooldown_minutes_after_stop": 30,
+            "max_drawdown": 0.20,
+            "max_trades_per_window": 8,
+            "window_seconds": 3600,
+            "stop_loss_porcentaje": 0.10,
+            "trailing_stop_porcentaje": 0.08,
+            "etiqueta_cartera": "ALTO RIESGO",
+            "state_file": "state_high_risk.json",
+            "warmup_seconds": 180,
+            "max_weight": 0.35,
+            "top_n_posiciones": 6,
+            "usar_filtro_top": True,
+            "top_criterio": "sharpe",
+            "allocation_pct": 0.50,
+            "cash_reserve": 500.0,
+            "cash_only": True,
+        }
     if env_config:
         for k, v in env_config.items():
             if k in base and v is not None:
@@ -229,24 +555,97 @@ def get_portfolio_config(tipo_cartera, env_config=None):
     return base
 
 
+def aplicar_max_weight_pesos(
+    pesos: Dict[str, float],
+    max_weight: float = 0.15,
+    max_iter: int = 25,
+) -> Dict[str, float]:
+    """
+    Reaplica límite de concentración DESPUÉS de Top-N / renormalización.
+    Evita que un Top-4 convierta un 15% teórico en 40%+.
+    """
+    if not pesos:
+        return pesos
+    if max_weight is None or max_weight <= 0:
+        total = sum(max(0.0, float(v)) for v in pesos.values())
+        if total <= 0:
+            return pesos
+        return {k: max(0.0, float(v)) / total for k, v in pesos.items()}
+
+    w = {k: max(0.0, float(v)) for k, v in pesos.items()}
+    n = len(w)
+    # Si es imposible (n * max_weight < 1), relajar al mínimo factible
+    if n > 0 and n * max_weight < 1.0 - 1e-12:
+        max_weight = 1.0 / n
+
+    for _ in range(max_iter):
+        total = sum(w.values())
+        if total <= 0:
+            return {k: 1.0 / n for k in w}
+        w = {k: v / total for k, v in w.items()}
+        if all(v <= max_weight + 1e-12 for v in w.values()):
+            return w
+        excess = 0.0
+        free = []
+        for k, v in list(w.items()):
+            if v > max_weight:
+                excess += v - max_weight
+                w[k] = max_weight
+            else:
+                free.append(k)
+        if excess <= 0 or not free:
+            break
+        free_total = sum(w[k] for k in free)
+        if free_total <= 0:
+            add = excess / len(free)
+            for k in free:
+                w[k] += add
+        else:
+            for k in free:
+                w[k] += excess * (w[k] / free_total)
+
+    total = sum(w.values())
+    return {k: v / total for k, v in w.items()} if total > 0 else w
+
+
+def resolve_peak_and_port(state: Dict[str, Any], port_value: float) -> Tuple[float, float]:
+    """
+    Devuelve (port_value, peak_equity) actualizando el pico en state['meta'].
+    El peak NUNCA se reinicia al equity actual: se carga del estado y solo sube.
+    """
+    meta = state.setdefault("meta", {}) if state is not None else {}
+    peak = meta.get("peak_equity")
+    try:
+        peak_f = float(peak) if peak is not None else None
+    except (TypeError, ValueError):
+        peak_f = None
+    pv = float(port_value)
+    if peak_f is None or peak_f <= 0:
+        peak_f = pv
+    else:
+        peak_f = max(peak_f, pv)
+    meta["peak_equity"] = peak_f
+    return pv, peak_f
+
+
 def risk_checks(port_value, peak_equity, orders_in_window, config):
     """
     Verifica si está permitido abrir nuevas operaciones.
     - max_drawdown: bloquea si (peak - current) / peak > max_drawdown.
     - max_trades_per_window: bloquea si len(orders_in_window) >= max_trades_per_window.
+    IMPORTANTE: port_value debe ser el equity ACTUAL y peak_equity el pico histórico real.
     Returns (ok_to_trade: bool, reason: str).
     """
     max_dd = config.get("max_drawdown", 0.10)
     max_trades = config.get("max_trades_per_window", 3)
     window_sec = config.get("window_seconds", 86400)
     now = datetime.now()
-    # Filtrar órdenes dentro de la ventana
     cutoff = now - timedelta(seconds=window_sec)
-    recent = [t for t in orders_in_window if t > cutoff]
+    recent = [t for t in (orders_in_window or []) if t > cutoff]
     if len(recent) >= max_trades:
         return False, f"max_trades_per_window alcanzado ({len(recent)} >= {max_trades})"
-    if peak_equity and peak_equity > 0 and port_value < peak_equity:
-        dd = (peak_equity - port_value) / peak_equity
+    if peak_equity and peak_equity > 0 and port_value is not None:
+        dd = compute_drawdown(float(peak_equity), float(port_value))
         if dd >= max_dd:
             return False, f"max_drawdown alcanzado ({dd*100:.1f}% >= {max_dd*100:.0f}%)"
     return True, "ok"
@@ -329,10 +728,14 @@ def generate_big_report(
     last_orders=None,
     pesos_objetivo=None,
     peak_equity: Optional[float] = None,
+    image_path: Optional[str] = None,
+    image_paths=None,
+    enviar_foto_fn=None,
 ):
     """
     Reporte completo: resumen, PnL, posiciones, pesos actual vs objetivo, señales resumidas,
-    exposición/riesgo, acciones desde último reporte. NO ejecuta órdenes.
+    exposición/riesgo, acciones desde último reporte. Envía cada gráfica por separado a Telegram.
+    NO ejecuta órdenes.
     """
     if not trading or not trading.api:
         return
@@ -373,12 +776,47 @@ def generate_big_report(
             msg += "  (ninguna)\n"
         _logger.info("[%s] Reporte completo generado.", etq)
         if send_telegram and enviar_telegram_fn and telegram_params:
-            enviar_telegram_fn(
-                telegram_params.get("bot_token"),
-                telegram_params.get("chat_id"),
-                msg,
-            )
+            bot_token = telegram_params.get("bot_token")
+            chat_id = telegram_params.get("chat_id")
+            enviar_telegram_fn(bot_token, chat_id, msg)
             _logger.info("[%s] Reporte completo enviado a Telegram.", etq)
+            fotos = []
+            if image_paths:
+                for item in image_paths:
+                    if isinstance(item, dict):
+                        fotos.append(item)
+                    elif isinstance(item, (list, tuple)) and item:
+                        fotos.append({"path": item[0], "caption": item[1] if len(item) > 1 else ""})
+                    elif isinstance(item, str):
+                        fotos.append({"path": item, "caption": ""})
+            elif image_path:
+                if isinstance(image_path, (list, tuple)):
+                    for item in image_path:
+                        if isinstance(item, dict):
+                            fotos.append(item)
+                        elif isinstance(item, str):
+                            fotos.append({"path": item, "caption": ""})
+                else:
+                    fotos.append({"path": image_path, "caption": "Gráficas de cartera"})
+            enviadas = 0
+            for i, item in enumerate(fotos, 1):
+                path = item.get("path")
+                caption_txt = (item.get("caption") or "Gráfica").strip()
+                if not path or not enviar_foto_fn:
+                    continue
+                if not os.path.isfile(path):
+                    _logger.warning("[%s] Gráfica no encontrada: %s", etq, path)
+                    continue
+                caption = "📊 [%s] %s (%d/%d)" % (etq, caption_txt, i, len(fotos))
+                ok = enviar_foto_fn(bot_token, chat_id, path, caption=caption)
+                if ok:
+                    enviadas += 1
+                    _logger.info("[%s] Gráfica enviada a Telegram: %s", etq, path)
+                else:
+                    _logger.warning("[%s] No se pudo enviar gráfica a Telegram: %s", etq, path)
+                time.sleep(0.4)
+            if fotos and enviadas == 0 and enviar_foto_fn is None:
+                _logger.warning("[%s] Hay gráficas pero no hay enviar_foto_fn", etq)
     except Exception as e:
         _logger.warning("generate_big_report: %s", e)
 

@@ -15,7 +15,7 @@ def main():
     now = datetime.now(timezone.utc)
     now_ts = now.timestamp()
 
-    for label, state_file in [("Largo plazo (bajo riesgo)", "state_low_risk.json"),
+    for label, state_file in [("CORE / Largo plazo", "state_low_risk.json"),
                                ("Alto riesgo", "state_high_risk.json")]:
         path = os.path.join(script_dir, state_file)
         print("=" * 60)

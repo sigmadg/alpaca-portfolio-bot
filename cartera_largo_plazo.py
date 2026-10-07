@@ -4,12 +4,39 @@ Estrategia: Minimización de Riesgo y Maximización de Sharpe Ratio
 Basado en Teoría de Markowitz y CAPM (Tema 9 y Tema 10)
 """
 
+import os
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
+GRAFICOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_graficos')
+
+
+def _guardar_grafica(fig, slug, stamp):
+    os.makedirs(GRAFICOS_DIR, exist_ok=True)
+    path = os.path.join(GRAFICOS_DIR, f'{slug}_{stamp}.png')
+    fig.tight_layout()
+    fig.savefig(path, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+def get_tickers_largo_plazo():
+    """Universo CORE / largo plazo (no overlap operativo con alto riesgo)."""
+    return {
+        'SPY', 'VTI', 'QQQ', 'VEA',
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN',
+        'BND', 'TLT', 'GLD',
+        'JNJ', 'PG', 'KO', 'WMT', 'VZ', 'LMT',
+        'V', 'MA', 'JPM',
+        'AVGO', 'ASML', 'QCOM', 'TSM',
+        'BRK.B', 'XOM', 'CVX',
+    }
 
 # Intentar importar yfinance
 try:
@@ -513,110 +540,118 @@ def analizar_cartera_largo_plazo(capital_inicial=10000, riesgo_max=0.15,
     # ========================================================================
     # PARTE 6: GRÁFICOS (si se solicita)
     # ========================================================================
+    grafico_path = None
+    grafico_paths = []
     if generar_graficos:
-        print("\n📊 Generando gráficos...")
+        print("\n📊 Generando gráficos (uno por imagen)...")
         try:
-            fig = plt.figure(figsize=(16, 12))
-            
-            # 1. Distribución de pesos
-            ax1 = plt.subplot(2, 3, 1)
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             tickers_grafico = [t for t, p in pesos_ordenados]
-            pesos_grafico = [p*100 for t, p in pesos_ordenados]
-            ax1.barh(tickers_grafico, pesos_grafico)
-            ax1.set_xlabel('Peso (%)')
-            ax1.set_title('Distribución de Pesos Optimizados')
-            ax1.grid(True, alpha=0.3)
-            
-            # 2. Riesgo vs Rendimiento
-            ax2 = plt.subplot(2, 3, 2)
+            pesos_grafico = [p * 100 for t, p in pesos_ordenados]
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.barh(tickers_grafico, pesos_grafico)
+            ax.set_xlabel('Peso (%)')
+            ax.set_title('Distribución de Pesos Optimizados')
+            ax.grid(True, alpha=0.3)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'lp_pesos', stamp),
+                'caption': 'Distribución de pesos',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 6))
             for i, ticker in enumerate(ticker_symbols):
                 riesgo_activo = np.sqrt(C[i, i])
                 rend_activo = m[i]
-                ax2.scatter(riesgo_activo*100, rend_activo*100, alpha=0.6)
-                ax2.annotate(ticker, (riesgo_activo*100, rend_activo*100), 
-                            fontsize=8)
-            ax2.scatter(riesgo_cartera*100, rendimiento_cartera*100, 
-                       color='red', s=200, marker='*', label='Cartera Optimizada')
-            ax2.set_xlabel('Riesgo (%)')
-            ax2.set_ylabel('Rendimiento Esperado (%)')
-            ax2.set_title('Riesgo vs Rendimiento')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            # 3. Distribución de valores futuros
-            ax3 = plt.subplot(2, 3, 3)
-            ax3.hist(valores_futuros, bins=50, edgecolor='black', alpha=0.7)
-            ax3.axvline(capital_inicial, color='red', linestyle='--', 
-                       label='Capital Inicial')
-            ax3.axvline(np.mean(valores_futuros), color='green', 
-                       linestyle='--', label='Valor Esperado')
-            ax3.set_xlabel('Valor ($)')
-            ax3.set_ylabel('Frecuencia')
-            ax3.set_title('Distribución de Valores Futuros (1 año)')
-            ax3.legend()
-            ax3.grid(True, alpha=0.3)
-            
-            # 4. Matriz de correlación
-            ax4 = plt.subplot(2, 3, 4)
+                ax.scatter(riesgo_activo * 100, rend_activo * 100, alpha=0.6)
+                ax.annotate(ticker, (riesgo_activo * 100, rend_activo * 100), fontsize=8)
+            ax.scatter(
+                riesgo_cartera * 100, rendimiento_cartera * 100,
+                color='red', s=200, marker='*', label='Cartera Optimizada',
+            )
+            ax.set_xlabel('Riesgo (%)')
+            ax.set_ylabel('Rendimiento Esperado (%)')
+            ax.set_title('Riesgo vs Rendimiento')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'lp_riesgo_rendimiento', stamp),
+                'caption': 'Riesgo vs rendimiento',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(valores_futuros, bins=50, edgecolor='black', alpha=0.7)
+            ax.axvline(capital_inicial, color='red', linestyle='--', label='Capital Inicial')
+            ax.axvline(np.mean(valores_futuros), color='green', linestyle='--', label='Valor Esperado')
+            ax.set_xlabel('Valor ($)')
+            ax.set_ylabel('Frecuencia')
+            ax.set_title('Distribución de Valores Futuros (1 año)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'lp_valores_futuros', stamp),
+                'caption': 'Valores futuros (1 año)',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 8))
             matriz_correlacion = rendimientos.corr()
-            im = ax4.imshow(matriz_correlacion, cmap='coolwarm', aspect='auto', 
-                           vmin=-1, vmax=1)
-            ax4.set_xticks(range(len(ticker_symbols)))
-            ax4.set_yticks(range(len(ticker_symbols)))
-            ax4.set_xticklabels(ticker_symbols, rotation=45, ha='right')
-            ax4.set_yticklabels(ticker_symbols)
-            ax4.set_title('Matriz de Correlación')
-            plt.colorbar(im, ax=ax4)
-            
-            # 5. Evolución de precios (últimos 6 meses)
-            ax5 = plt.subplot(2, 3, 5)
+            im = ax.imshow(matriz_correlacion, cmap='coolwarm', aspect='auto', vmin=-1, vmax=1)
+            ax.set_xticks(range(len(ticker_symbols)))
+            ax.set_yticks(range(len(ticker_symbols)))
+            ax.set_xticklabels(ticker_symbols, rotation=45, ha='right')
+            ax.set_yticklabels(ticker_symbols)
+            ax.set_title('Matriz de Correlación')
+            fig.colorbar(im, ax=ax)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'lp_correlacion', stamp),
+                'caption': 'Matriz de correlación',
+            })
+
+            fig, ax = plt.subplots(figsize=(10, 6))
             precios_normalizados = precios / precios.iloc[0]
-            for ticker in tickers_grafico[:5]:  # Top 5
+            for ticker in tickers_grafico[:5]:
                 if ticker in precios_normalizados.columns:
-                    ax5.plot(precios_normalizados.index, 
-                            precios_normalizados[ticker], 
-                            label=ticker, alpha=0.7)
-            ax5.set_xlabel('Fecha')
-            ax5.set_ylabel('Precio Normalizado')
-            ax5.set_title('Evolución de Precios (Top 5)')
-            ax5.legend()
-            ax5.grid(True, alpha=0.3)
-            
-            # 6. Resumen
-            ax6 = plt.subplot(2, 3, 6)
-            ax6.axis('off')
-            resumen_texto = f"""
-RESUMEN DE CARTERA LARGO PLAZO
+                    ax.plot(precios_normalizados.index, precios_normalizados[ticker], label=ticker, alpha=0.7)
+            ax.set_xlabel('Fecha')
+            ax.set_ylabel('Precio Normalizado')
+            ax.set_title('Evolución de Precios (Top 5)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'lp_evolucion', stamp),
+                'caption': 'Evolución de precios (Top 5)',
+            })
 
-Capital Inicial: ${capital_inicial:,.2f}
-Estrategia: {estrategia.upper()}
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.axis('off')
+            resumen_texto = (
+                "RESUMEN DE CARTERA LARGO PLAZO\n\n"
+                f"Capital Inicial: ${capital_inicial:,.2f}\n"
+                f"Estrategia: {estrategia.upper()}\n\n"
+                f"Rendimiento Esperado: {rendimiento_cartera*100:.2f}% anual\n"
+                f"Riesgo: {riesgo_cartera*100:.2f}% anual\n"
+                f"Sharpe Ratio: {resultado.get('sharpe_ratio', 0):.3f}\n\n"
+                f"Valor Esperado (1 año): ${np.mean(valores_futuros):,.2f}\n"
+                f"Ganancia Esperada: ${np.mean(valores_futuros) - capital_inicial:,.2f}\n\n"
+                f"Probabilidad de Ganancia: {probabilidad_ganancia:.1f}%\n"
+                f"Peor Caso (5%): ${np.percentile(valores_futuros, 5):,.2f}\n"
+                f"Mejor Caso (95%): ${np.percentile(valores_futuros, 95):,.2f}\n\n"
+                f"Activos en Cartera: {len(pesos_filtrados)}"
+            )
+            ax.text(0.08, 0.5, resumen_texto, fontsize=12, verticalalignment='center', family='monospace')
+            grafico_paths.append({
+                'path': _guardar_grafica(fig, 'lp_resumen', stamp),
+                'caption': 'Resumen de cartera',
+            })
 
-Rendimiento Esperado: {rendimiento_cartera*100:.2f}% anual
-Riesgo: {riesgo_cartera*100:.2f}% anual
-Sharpe Ratio: {resultado.get('sharpe_ratio', 0):.3f}
-
-Valor Esperado (1 año): ${np.mean(valores_futuros):,.2f}
-Ganancia Esperada: ${np.mean(valores_futuros) - capital_inicial:,.2f}
-
-Probabilidad de Ganancia: {probabilidad_ganancia:.1f}%
-Peor Caso (5%): ${np.percentile(valores_futuros, 5):,.2f}
-Mejor Caso (95%): ${np.percentile(valores_futuros, 95):,.2f}
-
-Activos en Cartera: {len(pesos_filtrados)}
-            """
-            ax6.text(0.1, 0.5, resumen_texto, fontsize=10, 
-                    verticalalignment='center', family='monospace')
-            
-            plt.tight_layout()
-            
-            fecha_actual = datetime.now().strftime('%Y%m%d')
-            nombre_archivo = f'cartera_largo_plazo_{fecha_actual}.png'
-            plt.savefig(nombre_archivo, dpi=150, bbox_inches='tight')
-            print(f"   ✅ Gráfico guardado: {nombre_archivo}")
-            plt.close()
-            
+            grafico_path = grafico_paths[0]['path'] if grafico_paths else None
+            print(f"   ✅ {len(grafico_paths)} gráficos guardados por separado")
         except Exception as e:
             print(f"   ⚠️  Error generando gráficos: {e}")
+            try:
+                plt.close('all')
+            except Exception:
+                pass
     
     # ========================================================================
     # RESULTADOS FINALES
@@ -632,7 +667,9 @@ Activos en Cartera: {len(pesos_filtrados)}
         'valores_futuros_simulados': valores_futuros,
         'probabilidad_ganancia': probabilidad_ganancia,
         'tickers': ticker_symbols,
-        'nombres': nombres
+        'nombres': nombres,
+        'grafico_path': grafico_path,
+        'grafico_paths': grafico_paths,
     }
     
     return resultados
